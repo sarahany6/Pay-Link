@@ -1,2 +1,2 @@
-# Pay-Link-
+# Pay-Link
 Digital payment system
