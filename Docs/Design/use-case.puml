@@ -1,0 +1,66 @@
+@startuml
+left to right direction
+skinparam packageStyle rectangle
+skinparam nodesep 30
+skinparam ranksep 80
+
+actor Customer
+actor Agent
+actor Admin
+actor "Support Employee" as Support
+
+rectangle PayLink {
+  usecase "Register Account" as UC1
+  usecase "Top Up Wallet" as UC2
+  usecase "View Wallet and History" as UC3
+  usecase "View Billers and Fields" as UC4
+  usecase "Run Bill Inquiry" as UC5
+  usecase "Pay a Bill" as UC6
+  usecase "Pay as Agent" as UC8
+  usecase "Request Refund" as UC7
+  usecase "Send Payment Notifications" as UC18
+  usecase "Upgrade to Verified" as UC9
+  usecase "Manage Billers" as UC10
+  usecase "Edit Fees and Limits" as UC11
+  usecase "View Daily Totals" as UC12
+  usecase "Search Payment by Reference" as UC13
+  usecase "Block and Unblock Account" as UC14
+  usecase "Run Daily Reconciliation" as UC15
+  usecase "Re-query Unknown Payments" as UC16
+  usecase "Process TopUpNet Callback" as UC17
+}
+
+actor "Biller System" as Biller
+actor "SMS/Push Provider" as SMS
+actor Scheduler
+
+Customer --> UC1
+Customer --> UC2
+Customer --> UC3
+Customer --> UC4
+Customer --> UC5
+Customer --> UC6
+Customer --> UC7
+Agent --> UC2
+Agent --> UC8
+Admin --> UC9
+Admin --> UC10
+Admin --> UC11
+Admin --> UC12
+Support --> UC13
+Support --> UC14
+Support --> UC15
+Support --> UC7
+
+UC5 --> Biller
+UC6 --> Biller
+UC16 --> Biller
+UC17 <-- Biller
+UC18 --> SMS
+UC15 <-- Scheduler
+UC16 <-- Scheduler
+
+UC8 ..> UC6 : <<include>>
+UC6 ..> UC18 : <<include>>
+UC7 ..> UC18 : <<include>>
+@enduml
