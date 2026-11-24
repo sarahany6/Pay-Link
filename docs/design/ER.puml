@@ -1,0 +1,367 @@
+@startuml
+title PayLink - ER Diagram (PostgreSQL)
+hide circle
+skinparam linetype ortho
+skinparam shadowing false
+skinparam nodesep 40
+skinparam ranksep 50
+
+legend top left
+  * = NOT NULL.  PK/FK/UQ = primary / foreign / unique key.
+  Money = NUMERIC(12,2), currency EGP. Percentages = NUMERIC(5,2) (1.50 = 1.5%).
+  Enumerations are CHECK constraints, not tables. IDs are BIGINT identity.
+  NOT stored (derived): wallet available/held balance, system fee income,
+  payment total = bill_amount + fee. Use SUM over ledger_entries.
+endlegend
+
+' ---------- People ----------
+entity verification_levels {
+  * id : BIGINT <<PK>>
+  --
+  * name : VARCHAR(30) <<UQ>>
+  * daily_limit : NUMERIC(12,2)
+}
+note right of verification_levels
+  CHECK (daily_limit > 0)
+end note
+
+entity users {
+  * id : BIGINT <<PK>>
+  --
+  * role : VARCHAR(20)
+  * full_name : VARCHAR(100)
+  * phone_number : VARCHAR(20) <<UQ>>
+  * email : VARCHAR(150) <<UQ>>
+  * status : VARCHAR(10) = 'Active'
+  blocked_until : TIMESTAMPTZ
+  block_reason : VARCHAR(255)
+  verification_level_id : BIGINT <<FK>>
+  shop_name : VARCHAR(100)
+  terminal_id : VARCHAR(30) <<UQ>>
+}
+note right of users
+  CHECK role IN ('Customer','Agent','Admin','SupportEmployee')
+  CHECK status IN ('Active','Blocked')
+  CHECK (status='Blocked' OR (blocked_until IS NULL AND block_reason IS NULL))
+  CHECK (role='Customer') = (verification_level_id IS NOT NULL)
+  CHECK (role='Agent') = (shop_name IS NOT NULL AND terminal_id IS NOT NULL)
+  CHECK (role='Agent' OR (shop_name IS NULL AND terminal_id IS NULL))
+end note
+
+' ---------- Wallet and ledger ----------
+entity wallets {
+  * id : BIGINT <<PK>>
+  --
+  * user_id : BIGINT <<FK,UQ>>
+  * currency : CHAR(3) = 'EGP'
+}
+note right of wallets
+  CHECK (currency = 'EGP')
+end note
+
+entity system_accounts {
+  * id : BIGINT <<PK>>
+  --
+  * name : VARCHAR(50) <<UQ>>
+}
+
+entity audit_records {
+  * id : BIGINT <<PK>>
+  --
+  * action : VARCHAR(100)
+  * who : VARCHAR(100)
+  * why : VARCHAR(255)
+  * occurred_at : TIMESTAMPTZ
+  performed_by_user_id : BIGINT <<FK>>
+}
+note right of audit_records
+  CHECK (length(trim(who)) > 0 AND length(trim(why)) > 0)
+  performed_by_user_id NULL for system actors
+  (Scheduler, callbacks, retries)
+end note
+
+entity ledger_entries {
+  * id : BIGINT <<PK>>
+  --
+  wallet_id : BIGINT <<FK>>
+  system_account_id : BIGINT <<FK>>
+  agent_id : BIGINT <<FK>>
+  payment_id : BIGINT <<FK>>
+  * audit_record_id : BIGINT <<FK,UQ>>
+  * entry_type : VARCHAR(20)
+  * bucket : VARCHAR(10)
+  * amount : NUMERIC(12,2)
+  * created_at : TIMESTAMPTZ
+  top_up_method : VARCHAR(20)
+}
+note right of ledger_entries
+  CHECK ((wallet_id IS NOT NULL)::int + (system_account_id IS NOT NULL)::int = 1)
+  CHECK entry_type IN ('TopUp','Hold','Release','Charge',
+    'FeeIncome','Commission','RefundCredit')
+  CHECK bucket IN ('Available','Held')
+  CHECK (amount <> 0)   -- signed
+  CHECK (system_account_id IS NULL OR bucket = 'Available')
+  CHECK (top_up_method IS NULL OR top_up_method IN ('SimulatedCard','AgentCash'))
+  CHECK (top_up_method IS NOT NULL) = (entry_type = 'TopUp')
+  CHECK COALESCE(top_up_method = 'AgentCash', false) = (agent_id IS NOT NULL)
+  Balance = SUM(amount) per wallet and bucket
+end note
+
+' ---------- Billers and fees ----------
+entity billers {
+  * id : BIGINT <<PK>>
+  --
+  * name : VARCHAR(50) <<UQ>>
+  * is_active : BOOLEAN = true
+}
+
+entity fee_rules {
+  * id : BIGINT <<PK>>
+  --
+  * name : VARCHAR(60)
+  * fee_type : VARCHAR(12)
+  fixed_amount : NUMERIC(12,2)
+  percentage : NUMERIC(5,2)
+  minimum_fee : NUMERIC(12,2)
+  tier_threshold : NUMERIC(12,2)
+  low_tier_fee : NUMERIC(12,2)
+  high_tier_fee : NUMERIC(12,2)
+  promotion_start : DATE
+  promotion_end : DATE
+}
+note right of fee_rules
+  CHECK fee_type IN ('Fixed','Percentage','Tiered')
+  Fixed => fixed_amount NOT NULL
+  Percentage => percentage NOT NULL
+  Tiered => tier_threshold, low_tier_fee, high_tier_fee NOT NULL
+  CHECK all amounts/percentage >= 0
+  CHECK (promotion_start IS NULL) = (promotion_end IS NULL)
+  CHECK (promotion_end >= promotion_start)
+end note
+
+entity biller_services {
+  * id : BIGINT <<PK>>
+  --
+  * biller_id : BIGINT <<FK>>
+  * fee_rule_id : BIGINT <<FK>>
+  * name : VARCHAR(60)
+  * is_active : BOOLEAN = true
+  * min_amount : NUMERIC(12,2)
+  * max_amount : NUMERIC(12,2)
+  * required_fields : JSONB = '[]'
+}
+note right of biller_services
+  UNIQUE (biller_id, name)
+  CHECK (min_amount >= 0 AND max_amount >= min_amount)
+  CHECK (jsonb_typeof(required_fields) = 'array')
+end note
+
+' ---------- Payments ----------
+entity fraud_rules {
+  * id : BIGINT <<PK>>
+  --
+  * rule_type : VARCHAR(20)
+  * is_active : BOOLEAN = true
+  max_payments : INTEGER
+  window_seconds : INTEGER
+  block_minutes : INTEGER
+  min_amount : NUMERIC(12,2)
+  max_amount : NUMERIC(12,2)
+}
+note right of fraud_rules
+  CHECK rule_type IN ('DailyLimit','VelocityLimit',
+    'BlockedAccount','SingleAmountLimit')
+  VelocityLimit => max_payments, window_seconds, block_minutes NOT NULL (> 0)
+  SingleAmountLimit => min_amount, max_amount NOT NULL, max >= min
+end note
+
+entity payments {
+  * id : BIGINT <<PK>>
+  --
+  * reference : VARCHAR(40) <<UQ>>
+  * idempotency_key : VARCHAR(100) <<UQ>>
+  * customer_id : BIGINT <<FK>>
+  agent_id : BIGINT <<FK>>
+  * biller_service_id : BIGINT <<FK>>
+  rejected_by_fraud_rule_id : BIGINT <<FK>>
+  * customer_inputs : JSONB = '{}'
+  * bill_amount : NUMERIC(12,2)
+  * fee : NUMERIC(12,2)
+  * state : VARCHAR(15)
+  status_reason : VARCHAR(255)
+  biller_reference : VARCHAR(100)
+  * requery_count : INTEGER = 0
+  next_requery_at : TIMESTAMPTZ
+  * created_at : TIMESTAMPTZ
+}
+note right of payments
+  CHECK state IN ('Initiated','FundsHeld','SentToBiller','Completed',
+    'Failed','Unknown','Rejected','Refunded')
+  CHECK (bill_amount > 0 AND fee >= 0 AND requery_count >= 0)
+  CHECK (rejected_by_fraud_rule_id IS NULL OR state = 'Rejected')
+  NO total column (= bill_amount + fee)
+end note
+
+entity payment_state_changes {
+  * id : BIGINT <<PK>>
+  --
+  * payment_id : BIGINT <<FK>>
+  from_state : VARCHAR(15)
+  * to_state : VARCHAR(15)
+  * changed_at : TIMESTAMPTZ
+  * trigger_source : VARCHAR(60)
+  reason : VARCHAR(255)
+}
+note right of payment_state_changes
+  CHECK from_state/to_state IN (the 8 payment states)
+  CHECK (from_state IS NULL OR from_state <> to_state)
+  FK ON DELETE CASCADE
+end note
+
+entity commissions {
+  * id : BIGINT <<PK>>
+  --
+  * payment_id : BIGINT <<FK,UQ>>
+  * agent_id : BIGINT <<FK>>
+  * ledger_entry_id : BIGINT <<FK,UQ>>
+  * rate : NUMERIC(5,2)
+  * amount : NUMERIC(12,2)
+  * credited_at : TIMESTAMPTZ
+}
+note right of commissions
+  CHECK (rate BETWEEN 0 AND 100 AND amount >= 0)
+end note
+
+entity refunds {
+  * id : BIGINT <<PK>>
+  --
+  * payment_id : BIGINT <<FK>>
+  * customer_id : BIGINT <<FK>>
+  decided_by_user_id : BIGINT <<FK>>
+  credit_ledger_entry_id : BIGINT <<FK,UQ>>
+  * amount : NUMERIC(12,2)
+  * status : VARCHAR(10) = 'Requested'
+  * reason : VARCHAR(255)
+  * requested_at : TIMESTAMPTZ
+  decided_at : TIMESTAMPTZ
+  decision_reason : VARCHAR(255)
+}
+note right of refunds
+  CHECK status IN ('Requested','Approved','Rejected')
+  CHECK (amount > 0)
+  CHECK (status='Requested') = (decided_at IS NULL AND decided_by_user_id IS NULL)
+  CHECK (credit_ledger_entry_id IS NULL OR status='Approved')
+  Approved + NULL credit entry = credit pending retry (US-27)
+  Payment stays Completed
+end note
+
+entity notifications {
+  * id : BIGINT <<PK>>
+  --
+  * customer_id : BIGINT <<FK>>
+  payment_id : BIGINT <<FK>>
+  * channel : VARCHAR(10)
+  * message : VARCHAR(500)
+  * status : VARCHAR(12) = 'Pending'
+  * attempts : INTEGER = 0
+  * created_at : TIMESTAMPTZ
+  last_attempt_at : TIMESTAMPTZ
+}
+note right of notifications
+  CHECK channel IN ('SMS','Push','Email')
+  CHECK status IN ('Pending','Sent','Undelivered')
+  CHECK (attempts BETWEEN 0 AND 3)
+  CHECK (status <> 'Undelivered' OR attempts = 3)
+end note
+
+' ---------- Settlement and reconciliation ----------
+entity settlement_files {
+  * id : BIGINT <<PK>>
+  --
+  * biller_id : BIGINT <<FK>>
+  * file_name : VARCHAR(150)
+  * business_date : DATE
+  * received_at : TIMESTAMPTZ
+}
+note right of settlement_files
+  UNIQUE (biller_id, file_name)
+end note
+
+entity settlement_lines {
+  * id : BIGINT <<PK>>
+  --
+  * settlement_file_id : BIGINT <<FK>>
+  * payment_reference : VARCHAR(40)
+  * amount : NUMERIC(12,2)
+  * status : VARCHAR(30)
+}
+note right of settlement_lines
+  payment_reference is NOT an FK:
+  the file may list payments PayLink lacks
+  CHECK (amount >= 0)
+end note
+
+entity reconciliation_reports {
+  * id : BIGINT <<PK>>
+  --
+  * settlement_file_id : BIGINT <<FK,UQ>>
+  * run_date : DATE
+  * generated_at : TIMESTAMPTZ
+}
+
+entity reconciliation_differences {
+  * id : BIGINT <<PK>>
+  --
+  * reconciliation_report_id : BIGINT <<FK>>
+  payment_id : BIGINT <<FK>>
+  * difference_type : VARCHAR(25)
+  * payment_reference : VARCHAR(40)
+  paylink_state : VARCHAR(15)
+  settlement_status : VARCHAR(30)
+  * reviewed : BOOLEAN = false
+}
+note right of reconciliation_differences
+  CHECK difference_type IN ('MissingInPayLink',
+    'MissingInSettlement','StatusMismatch')
+  MissingInPayLink => payment_id, paylink_state NULL
+  other types => payment_id NOT NULL
+  CHECK paylink_state IN (the 8 payment states) OR NULL
+end note
+
+' ---------- Relationships ----------
+verification_levels ||--o{ users : has
+users ||--o| wallets : owns
+wallets ||--o{ ledger_entries : records
+system_accounts ||--o{ ledger_entries : records
+users |o--o{ ledger_entries : collects cash top-up
+payments |o--o{ ledger_entries : moves money for
+audit_records ||--o| ledger_entries : audits
+users |o--o{ audit_records : performed by
+
+billers ||--|{ biller_services : offers
+fee_rules ||--o{ biller_services : prices
+
+users ||--o{ payments : makes (customer)
+users |o--o{ payments : processes (agent)
+biller_services ||--o{ payments : paid through
+fraud_rules |o--o{ payments : rejects
+payments ||--|{ payment_state_changes : history
+
+payments ||--o| commissions : earns
+users ||--o{ commissions : receives (agent)
+ledger_entries ||--o| commissions : credited by
+
+payments ||--o{ refunds : refund requests
+users ||--o{ refunds : requests (customer)
+users |o--o{ refunds : decides (support)
+ledger_entries |o--o| refunds : credited by
+
+users ||--o{ notifications : receives
+payments |o--o{ notifications : about
+
+billers ||--o{ settlement_files : sends
+settlement_files ||--o{ settlement_lines : lists
+settlement_files ||--o| reconciliation_reports : reconciled in
+reconciliation_reports ||--o{ reconciliation_differences : flags
+payments |o--o{ reconciliation_differences : concerns
+@enduml
