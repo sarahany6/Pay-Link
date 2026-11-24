@@ -111,6 +111,7 @@ Pay-Link/
 ## Team
  
 | Name | Role |
+|---|---|
 |Reem Hussein|Requirements & Use Case|
 |Malak Ahmed|Requirements & Documentation|
 |Rahma Elkholy|Design Diagrams|
