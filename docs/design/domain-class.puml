@@ -1,0 +1,284 @@
+@startuml
+title PayLink - Domain Class Diagram
+hide empty methods
+hide circle
+skinparam classAttributeIconSize 0
+skinparam shadowing false
+skinparam linetype ortho
+skinparam nodesep 40
+skinparam ranksep 50
+
+legend top left
+  Decimal = exact decimal type (never float). Currency is EGP.
+  /name = derived attribute (computed, never stored).
+endlegend
+
+' ---------- People ----------
+abstract class User {
+  fullName : String
+  phoneNumber : String
+  email : String
+  status : AccountStatus
+  blockedUntil : DateTime [0..1]
+  blockReason : String [0..1]
+}
+class Customer
+class Agent {
+  shopName : String
+  terminalId : String
+}
+class Admin
+class SupportEmployee
+User <|-- Customer
+User <|-- Agent
+User <|-- Admin
+User <|-- SupportEmployee
+
+class VerificationLevel {
+  name : String
+  dailyLimit : Decimal
+}
+
+' ---------- Wallet and ledger ----------
+class Wallet {
+  currency : String
+  /availableBalance : Decimal
+  /heldBalance : Decimal
+}
+class SystemAccount {
+  name : String
+  /feeIncomeBalance : Decimal
+}
+class LedgerEntry {
+  entryType : LedgerEntryType
+  bucket : BalanceBucket
+  amount : Decimal  {signed}
+  createdAt : DateTime
+  topUpMethod : TopUpMethod [0..1]
+}
+class AuditRecord {
+  action : String
+  who : String
+  why : String
+  occurredAt : DateTime
+}
+
+' ---------- Billers and fees ----------
+class Biller {
+  name : String
+  isActive : Boolean
+}
+class BillerService {
+  name : String
+  isActive : Boolean
+  minAmount : Decimal
+  maxAmount : Decimal
+  requiredFields : List<String>
+}
+class FeeRule {
+  name : String
+  feeType : FeeType
+  fixedAmount : Decimal [0..1]
+  percentage : Decimal [0..1]
+  minimumFee : Decimal [0..1]
+  tierThreshold : Decimal [0..1]
+  lowTierFee : Decimal [0..1]
+  highTierFee : Decimal [0..1]
+  promotionStart : Date [0..1]
+  promotionEnd : Date [0..1]
+}
+class Commission {
+  rate : Decimal
+  amount : Decimal
+  creditedAt : DateTime
+}
+
+' ---------- Payments ----------
+class Payment {
+  reference : String {unique}
+  idempotencyKey : String
+  customerInputs : Map<String,String>
+  billAmount : Decimal
+  fee : Decimal
+  /total : Decimal
+  state : PaymentState
+  statusReason : String [0..1]
+  billerReference : String [0..1]
+  requeryCount : Integer
+  nextRequeryAt : DateTime [0..1]
+  createdAt : DateTime
+}
+class PaymentStateChange {
+  fromState : PaymentState [0..1]
+  toState : PaymentState
+  changedAt : DateTime
+  trigger : String
+  reason : String [0..1]
+}
+class FraudRule {
+  ruleType : FraudRuleType
+  isActive : Boolean
+  maxPayments : Integer [0..1]
+  windowSeconds : Integer [0..1]
+  blockMinutes : Integer [0..1]
+  minAmount : Decimal [0..1]
+  maxAmount : Decimal [0..1]
+}
+class Refund {
+  amount : Decimal
+  status : RefundStatus
+  reason : String
+  requestedAt : DateTime
+  decidedAt : DateTime [0..1]
+  decisionReason : String [0..1]
+}
+class Notification {
+  channel : NotificationChannel
+  message : String
+  status : NotificationStatus
+  attempts : Integer
+  createdAt : DateTime
+  lastAttemptAt : DateTime [0..1]
+}
+
+' ---------- Settlement and reconciliation ----------
+class SettlementFile {
+  fileName : String
+  businessDate : Date
+  receivedAt : DateTime
+}
+class SettlementLine {
+  paymentReference : String
+  amount : Decimal
+  status : String
+}
+class ReconciliationReport {
+  runDate : Date
+  generatedAt : DateTime
+}
+class ReconciliationDifference {
+  differenceType : DifferenceType
+  paymentReference : String
+  payLinkState : PaymentState [0..1]
+  settlementStatus : String [0..1]
+  reviewed : Boolean
+}
+
+' ---------- Enumerations (one package, at the side) ----------
+package Enumerations {
+  enum PaymentState {
+    Initiated
+    FundsHeld
+    SentToBiller
+    Completed
+    Failed
+    Unknown
+    Rejected
+    Refunded
+  }
+  enum RefundStatus {
+    Requested
+    Approved
+    Rejected
+  }
+  enum LedgerEntryType {
+    TopUp
+    Hold
+    Release
+    Charge
+    FeeIncome
+    Commission
+    RefundCredit
+  }
+  enum BalanceBucket {
+    Available
+    Held
+  }
+  enum TopUpMethod {
+    SimulatedCard
+    AgentCash
+  }
+  enum FeeType {
+    Fixed
+    Percentage
+    Tiered
+  }
+  enum FraudRuleType {
+    DailyLimit
+    VelocityLimit
+    BlockedAccount
+    SingleAmountLimit
+  }
+  enum AccountStatus {
+    Active
+    Blocked
+  }
+  enum NotificationChannel {
+    SMS
+    Push
+    Email
+  }
+  enum NotificationStatus {
+    Pending
+    Sent
+    Undelivered
+  }
+  enum DifferenceType {
+    MissingInPayLink
+    MissingInSettlement
+    StatusMismatch
+  }
+}
+
+' ---------- Relationships ----------
+User "1" -- "0..1" Wallet : owns >
+Customer "*" -- "1" VerificationLevel : has >
+
+Wallet "1" -- "*" LedgerEntry : records >
+SystemAccount "1" -- "*" LedgerEntry : records >
+note "Each LedgerEntry belongs to exactly one of\nWallet or SystemAccount {xor}.\nBalances = sum of entries per bucket." as N1
+LedgerEntry .. N1
+Agent "0..1" -- "*" LedgerEntry : collects cash top-up >
+AuditRecord "1" -- "0..1" LedgerEntry : audits >
+AuditRecord "*" -- "0..1" User : performed by >
+
+Biller "1" -- "1..*" BillerService : offers >
+BillerService "*" -- "1" FeeRule : priced by >
+
+Customer "1" -- "*" Payment : makes >
+Agent "0..1" -- "*" Payment : processes at terminal >
+BillerService "1" -- "*" Payment : paid through >
+Payment "1" *-- "1..*" PaymentStateChange : history >
+FraudRule "0..1" -- "*" Payment : rejects >
+Payment "0..1" -- "*" LedgerEntry : moves money for >
+
+Payment "1" -- "0..1" Commission : earns >
+Agent "1" -- "*" Commission : receives >
+
+Payment "1" -- "*" Refund : refund requests >
+Customer "1" -- "*" Refund : requests >
+SupportEmployee "0..1" -- "*" Refund : decides >
+Refund "0..1" -- "0..1" LedgerEntry : credited by >
+
+Customer "1" -- "*" Notification : receives >
+Payment "0..1" -- "*" Notification : about >
+
+Biller "1" -- "*" SettlementFile : sends >
+SettlementFile "1" *-- "*" SettlementLine : lists >
+SettlementFile "1" -- "0..1" ReconciliationReport : reconciled in >
+ReconciliationReport "1" *-- "*" ReconciliationDifference : flags >
+ReconciliationDifference "*" -- "0..1" Payment : concerns >
+
+' ---------- Layout hints only (hidden, not model relationships) ----------
+Payment -[hidden]right- PaymentState
+PaymentState -[hidden]right- RefundStatus
+LedgerEntryType -[hidden]right- BalanceBucket
+TopUpMethod -[hidden]right- FeeType
+FraudRuleType -[hidden]right- AccountStatus
+NotificationChannel -[hidden]right- NotificationStatus
+PaymentState -[hidden]down- LedgerEntryType
+LedgerEntryType -[hidden]down- TopUpMethod
+TopUpMethod -[hidden]down- FraudRuleType
+FraudRuleType -[hidden]down- NotificationChannel
+NotificationChannel -[hidden]down- DifferenceType
+@enduml
