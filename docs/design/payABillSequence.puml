@@ -1,0 +1,202 @@
+@startuml
+title PayLink - Sequence Diagram: Pay a Bill
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam maxMessageSize 190
+skinparam responseMessageBelowArrow true
+skinparam noteBackgroundColor #FFF8DC
+
+legend top left
+  All amounts are Decimal in EGP (never float). Ledger entries are append-only;
+  balances are always derived from entries, never stored.
+  Yellow notes show the Payment state after each state change.
+endlegend
+
+actor Customer
+actor Agent
+participant PaymentProcessing
+participant FraudChecks
+participant FeesAndCommissions
+participant AccountsAndWallet
+participant BillerIntegration
+participant ElectroCo <<external system>>
+participant Notifications
+participant "SMS/Push Provider" as Provider <<external system>>
+participant AuditLog
+
+note over Agent : Only in an agent payment.\nReplies go to whoever confirmed\n(Customer or Agent).
+
+== 1. Bill inquiry ==
+Customer -> PaymentProcessing : requestInquiry(billerService, customerInputs)
+activate PaymentProcessing
+PaymentProcessing -> BillerIntegration : lookupBill(customerInputs)
+activate BillerIntegration
+BillerIntegration -> ElectroCo : billInquiry(customerInputs)
+activate ElectroCo
+alt ElectroCo returns the bill
+  ElectroCo --> BillerIntegration : billAmount
+  deactivate ElectroCo
+  BillerIntegration --> PaymentProcessing : billAmount
+  deactivate BillerIntegration
+  PaymentProcessing -> FeesAndCommissions : calculateFee(billerService, billAmount)
+  activate FeesAndCommissions
+  FeesAndCommissions --> PaymentProcessing : fee
+  deactivate FeesAndCommissions
+  PaymentProcessing --> Customer : billAmount, fee, total
+else ElectroCo cannot be reached
+  ElectroCo --> BillerIntegration : error or no answer
+  deactivate ElectroCo
+  BillerIntegration --> PaymentProcessing : inquiry failed
+  deactivate BillerIntegration
+  PaymentProcessing --> Customer : inquiry unavailable (no Payment created, flow ends)
+end
+deactivate PaymentProcessing
+note over PaymentProcessing : Steps below continue from the\nsuccessful inquiry only.
+
+== 2. Confirm payment with idempotency key ==
+alt Customer pays directly
+  Customer -> PaymentProcessing : confirmPayment(inquiry, idempotencyKey)
+else Agent pays at the terminal for the Customer
+  Agent -> PaymentProcessing : confirmPayment(inquiry, customer, idempotencyKey)
+end
+activate PaymentProcessing
+PaymentProcessing -> PaymentProcessing : find Payment by (customer, idempotencyKey)\n(one atomic find-or-create)
+
+alt idempotencyKey already used
+  PaymentProcessing --> Customer : first result returned (same reference and state),\nno second charge
+else new idempotencyKey
+  PaymentProcessing -> PaymentProcessing : create Payment (reference, billAmount, fee, total)
+  note over PaymentProcessing : State: Initiated
+
+  == 3. Fraud checks ==
+  PaymentProcessing -> FraudChecks : runChecks(customer, billAmount)
+  activate FraudChecks
+  FraudChecks -> FraudChecks : daily limit, single-payment min and max,\nvelocity, blocked account
+  FraudChecks --> PaymentProcessing : pass or fail (rule, reason)
+  deactivate FraudChecks
+
+  alt a fraud check fails
+    PaymentProcessing -> PaymentProcessing : reject Payment (statusReason)
+    note over PaymentProcessing : State: Rejected (final)\nInitiated -> Rejected, nothing held, no ledger entry
+    opt velocity rule failed
+      PaymentProcessing -> AccountsAndWallet : blockAccount(customer, 10 minutes)
+      activate AccountsAndWallet
+      AccountsAndWallet --> PaymentProcessing : account blocked
+      deactivate AccountsAndWallet
+    end
+    PaymentProcessing --> Customer : Rejected (reason)
+  else all fraud checks pass
+
+    == 4. Atomic funds check and hold, before calling the biller ==
+    PaymentProcessing -> AccountsAndWallet : holdFunds(customerWallet, total, reference)
+    activate AccountsAndWallet
+    AccountsAndWallet -> AccountsAndWallet : ONE atomic step: lock wallet, check available balance covers total,\nappend two LedgerEntry Hold: Available -total and Held +total
+    opt funds held
+      AccountsAndWallet -> AuditLog : writeAuditRecord(Hold, who, why, reference)
+      activate AuditLog
+      AuditLog --> AccountsAndWallet : recorded
+      deactivate AuditLog
+    end
+    AccountsAndWallet --> PaymentProcessing : funds held or insufficient funds
+    deactivate AccountsAndWallet
+
+    alt insufficient funds
+      PaymentProcessing -> PaymentProcessing : reject Payment (statusReason: insufficient funds)
+      note over PaymentProcessing : State: Rejected (final)\nInitiated -> Rejected, nothing held, no ledger entry
+      PaymentProcessing --> Customer : Rejected (insufficient funds)
+    else funds held
+      note over PaymentProcessing : State: FundsHeld\nInitiated -> FundsHeld
+
+      == 5. Send to ElectroCo ==
+      PaymentProcessing -> BillerIntegration : submitPayment(reference, billAmount, customerInputs)
+      activate BillerIntegration
+      BillerIntegration -> ElectroCo : payBill(reference, billAmount, customerInputs)
+      activate ElectroCo
+      note over PaymentProcessing : State: SentToBiller\nFundsHeld -> SentToBiller
+
+      == 6. Biller outcome ==
+      alt a) Biller confirms
+        ElectroCo --> BillerIntegration : confirmed (billerReference)
+        deactivate ElectroCo
+        BillerIntegration --> PaymentProcessing : confirmed
+        deactivate BillerIntegration
+        opt fee > 0
+          opt Agent involved
+            PaymentProcessing -> FeesAndCommissions : calculateCommission(fee)
+            activate FeesAndCommissions
+            FeesAndCommissions --> PaymentProcessing : commission = 40% of fee
+            deactivate FeesAndCommissions
+          end
+        end
+        PaymentProcessing -> AccountsAndWallet : settlePayment(reference, fee, commission)
+        activate AccountsAndWallet
+        AccountsAndWallet -> AccountsAndWallet : append LedgerEntry Charge (converts the hold)
+        opt fee > 0
+          AccountsAndWallet -> AccountsAndWallet : append LedgerEntry FeeIncome\n(fee to PayLink system account)
+          opt Agent involved
+            AccountsAndWallet -> AccountsAndWallet : append LedgerEntry Commission +commission\n(agent wallet)
+            AccountsAndWallet -> AccountsAndWallet : append LedgerEntry Commission -commission\n(PayLink system account)
+          end
+        end
+        AccountsAndWallet -> AuditLog : writeAuditRecord(Charge, FeeIncome, Commission, who, why, reference)
+        note right of AuditLog : One audit record covers the Charge,\nFeeIncome and Commission entries.
+        activate AuditLog
+        AuditLog --> AccountsAndWallet : recorded
+        deactivate AuditLog
+        AccountsAndWallet --> PaymentProcessing : settled
+        deactivate AccountsAndWallet
+        note over PaymentProcessing : State: Completed (final)\nSentToBiller -> Completed
+        PaymentProcessing --> Customer : Completed
+
+      else b) Biller refuses
+        ElectroCo --> BillerIntegration : refused (error code)
+        deactivate ElectroCo
+        BillerIntegration --> PaymentProcessing : refused
+        deactivate BillerIntegration
+        note over PaymentProcessing : State: Failed\nSentToBiller -> Failed
+        PaymentProcessing -> AccountsAndWallet : releaseHold(reference)
+        activate AccountsAndWallet
+        AccountsAndWallet -> AccountsAndWallet : append two LedgerEntry Release:\nHeld -total and Available +total
+        AccountsAndWallet -> AuditLog : writeAuditRecord(Release, who, why, reference)
+        activate AuditLog
+        AuditLog --> AccountsAndWallet : recorded
+        deactivate AuditLog
+        AccountsAndWallet --> PaymentProcessing : hold released
+        deactivate AccountsAndWallet
+        note over PaymentProcessing : State: Refunded (final)\nFailed -> Refunded
+        PaymentProcessing --> Customer : Failed, money returned to available balance
+
+      else c) No answer within 10 seconds
+        BillerIntegration -> BillerIntegration : wait for biller answer (timeout 10 s)
+        deactivate ElectroCo
+        BillerIntegration --> PaymentProcessing : timeout (no answer)
+        deactivate BillerIntegration
+        note over PaymentProcessing : State: Unknown\nSentToBiller -> Unknown\nMoney stays held, never refunded automatically
+        PaymentProcessing --> Customer : your payment is being processed
+        note over PaymentProcessing, BillerIntegration : The Scheduler re-queries after 1, 5 and 15 minutes\n(outside this diagram). Unknown -> Completed or Failed\nhappens there, not here.
+      end
+    end
+  end
+
+  == 7. Notifications (never change the payment state) ==
+  PaymentProcessing ->> Notifications : notifyOutcome(reference, state, statusReason)
+  activate Notifications
+  loop up to 3 attempts, stop when delivered
+    Notifications ->> Provider : sendSMS and sendPush (message includes statusReason)
+    activate Provider
+    alt delivered
+      Provider ->> Customer : SMS and push
+    else delivery fails
+      Provider --> Notifications : failure
+    end
+    deactivate Provider
+  end
+  opt all 3 attempts failed
+    Notifications -> Notifications : mark Notification Undelivered
+    note over PaymentProcessing, Notifications : A notification failure never changes the Payment state.
+  end
+  deactivate Notifications
+end
+deactivate PaymentProcessing
+@enduml

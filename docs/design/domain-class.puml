@@ -67,6 +67,7 @@ class AuditRecord {
 class Biller {
   name : String
   isActive : Boolean
+  integrationKey : String
 }
 class BillerService {
   name : String
@@ -236,11 +237,12 @@ Customer "*" -- "1" VerificationLevel : has >
 
 Wallet "1" -- "*" LedgerEntry : records >
 SystemAccount "1" -- "*" LedgerEntry : records >
-note "Each LedgerEntry belongs to exactly one of\nWallet or SystemAccount {xor}.\nBalances = sum of entries per bucket." as N1
+note "Each LedgerEntry belongs to exactly one of\nWallet or SystemAccount {xor}.\nBalances = sum of entries per bucket.\nHold and Release are each written as two entries\n(Available and Held).\nA commission is two entries (credit on the agent Wallet,\ndebit on the SystemAccount).\nNo entry is written when the amount is 0." as N1
 LedgerEntry .. N1
 Agent "0..1" -- "*" LedgerEntry : collects cash top-up >
-AuditRecord "1" -- "0..1" LedgerEntry : audits >
+AuditRecord "1" -- "0..*" LedgerEntry : audits >
 AuditRecord "*" -- "0..1" User : performed by >
+AuditRecord "*" -- "0..1" Payment : concerns >
 
 Biller "1" -- "1..*" BillerService : offers >
 BillerService "*" -- "1" FeeRule : priced by >
@@ -254,6 +256,7 @@ Payment "0..1" -- "*" LedgerEntry : moves money for >
 
 Payment "1" -- "0..1" Commission : earns >
 Agent "1" -- "*" Commission : receives >
+Commission "0..1" -- "1" LedgerEntry : credited by >
 
 Payment "1" -- "*" Refund : refund requests >
 Customer "1" -- "*" Refund : requests >

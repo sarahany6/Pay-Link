@@ -1,0 +1,133 @@
+@startuml
+title PayLink - Sequence Diagram: Refund a Failed Payment
+autonumber
+hide footbox
+skinparam shadowing false
+skinparam maxMessageSize 190
+skinparam responseMessageBelowArrow true
+skinparam noteBackgroundColor #FFF8DC
+
+legend top left
+  All amounts are Decimal in EGP (never float). Ledger entries are append-only;
+  balances are always derived from entries, never stored.
+  Yellow notes show the Payment state after each state change.
+  Scope: a payment that did not succeed becomes Failed and the Customer's money returns.
+endlegend
+
+participant ElectroCo <<external system>>
+participant TopUpNet <<external system>>
+participant BillerIntegration
+participant Reconciliation
+participant Scheduler
+participant PaymentProcessing
+participant AccountsAndWallet
+participant AuditLog
+participant Notifications
+participant "SMS/Push Provider" as Provider <<external system>>
+actor Customer
+
+note over PaymentProcessing : Precondition: the Payment is SentToBiller (trigger a) or Unknown (triggers b and c),\nand its funds are Held. The "refused during the call" flow is in Pay a Bill, not here.
+
+== 1. Failure signal: three triggers ==
+alt a) TopUpNet calls back "failed" for an accepted top-up
+  TopUpNet -> BillerIntegration : callback(reference, "failed", errorCode)
+  activate BillerIntegration
+  BillerIntegration -> PaymentProcessing : failedEvent(reference, who = TopUpNet callback, why = reason code)
+  deactivate BillerIntegration
+
+else b) Scheduler re-queries an Unknown payment (after 1, 5 or 15 minutes)
+  Scheduler -> PaymentProcessing : requeryUnknown(reference)
+  activate PaymentProcessing
+  PaymentProcessing -> BillerIntegration : queryStatus(reference)
+  activate BillerIntegration
+  BillerIntegration -> ElectroCo : statusInquiry(reference)
+  activate ElectroCo
+  alt ElectroCo says refused
+    ElectroCo --> BillerIntegration : refused (error code)
+    deactivate ElectroCo
+    BillerIntegration --> PaymentProcessing : refused (failedEvent: who = Scheduler, why = reason code)
+    deactivate BillerIntegration
+  else no answer within 10 seconds
+    BillerIntegration -> BillerIntegration : wait for biller answer (timeout 10 s)
+    deactivate ElectroCo
+    BillerIntegration --> PaymentProcessing : timeout (no answer)
+    deactivate BillerIntegration
+  end
+  deactivate PaymentProcessing
+
+else c) Nightly Reconciliation: an Unknown payment is not listed in the settlement file
+  Scheduler -> Reconciliation : startNightlyReconciliation()
+  activate Reconciliation
+  note over Reconciliation : ElectroCo sent the settlement file beforehand.\nReconciliation does not call ElectroCo or BillerIntegration.
+  Reconciliation -> Reconciliation : read the settlement file from ElectroCo,\ncompare it with PayLink's payments
+  Reconciliation -> Reconciliation : record the differences in the reconciliation report
+  loop for each Unknown payment NOT listed in the settlement file
+    Reconciliation -> PaymentProcessing : failedEvent(reference, who = Reconciliation, why = reason code)
+  end
+  deactivate Reconciliation
+end
+
+alt a failed event reached PaymentProcessing (trigger a, b refused, or c)
+  activate PaymentProcessing
+
+  == 2. Guard and transition to Failed ==
+  PaymentProcessing -> PaymentProcessing : lock the Payment row (by reference), then check current state
+  note over PaymentProcessing : The lock, the transition to Failed and the hold release happen in the same\ntransaction, so two events at the same moment never release the hold twice.
+
+  alt Payment is already Failed, Refunded or Completed (any state other than SentToBiller or Unknown)
+    PaymentProcessing -> PaymentProcessing : refuse the transition, ignore the event
+    PaymentProcessing -> AuditLog : writeAuditRecord(IgnoredFailedEvent, who = source system actor, why = reason code, reference)
+    activate AuditLog
+    AuditLog --> PaymentProcessing : recorded
+    deactivate AuditLog
+    note over PaymentProcessing : State: unchanged (Failed, Refunded or Completed)\nNo second release, no ledger entry
+
+  else Payment is SentToBiller or Unknown
+    PaymentProcessing -> PaymentProcessing : move Payment to Failed (statusReason from reason code)
+    note over PaymentProcessing : State: Failed\nSentToBiller -> Failed (trigger a)\nUnknown -> Failed (triggers b and c)
+
+    == 3. Release the hold ==
+    PaymentProcessing -> AccountsAndWallet : releaseHold(reference, who, why)
+    activate AccountsAndWallet
+    AccountsAndWallet -> AccountsAndWallet : append LedgerEntry Release\n(Held, -total)
+    AccountsAndWallet -> AccountsAndWallet : append LedgerEntry Release\n(Available, +total)
+    AccountsAndWallet -> AuditLog : writeAuditRecord(Release, who = TopUpNet callback, Scheduler or Reconciliation, why = reason code, reference)
+    activate AuditLog
+    AuditLog --> AccountsAndWallet : recorded
+    deactivate AuditLog
+    note over AccountsAndWallet, AuditLog : One audit record covers both Release entries.
+    AccountsAndWallet --> PaymentProcessing : hold released
+    deactivate AccountsAndWallet
+    PaymentProcessing -> PaymentProcessing : move Payment to Refunded
+    note over PaymentProcessing : State: Refunded (final)\nFailed -> Refunded
+
+    == 4. Notify the Customer (never changes the payment state) ==
+    PaymentProcessing ->> Notifications : notifyOutcome(reference, Refunded, statusReason)
+    activate Notifications
+    note over Notifications, Provider : Customer only.
+    loop up to 3 attempts, stop when delivered
+      Notifications ->> Provider : sendSMS and sendPush (message includes statusReason)
+      activate Provider
+      alt delivered
+        Provider ->> Customer : SMS and push
+        deactivate Provider
+      else delivery fails
+        Provider --> Notifications : failure
+        deactivate Provider
+      end
+    end
+    opt all 3 attempts failed
+      Notifications -> Notifications : mark Notification Undelivered
+      note over PaymentProcessing, Notifications : A notification failure never changes the Payment state.
+    end
+    deactivate Notifications
+  end
+  deactivate PaymentProcessing
+
+else no failed event: the re-query (trigger b) got no answer
+  note over PaymentProcessing : State: Unknown (unchanged)\nThe hold stays, nothing is refunded, no ledger entry.\nUnknown is never refunded automatically.
+  note over PaymentProcessing, Scheduler : The Scheduler's next re-query (1, 5, 15 minutes) and the nightly\nReconciliation run outside this diagram.
+end
+
+note over PaymentProcessing, AccountsAndWallet : A refund of a Completed payment is a separate Refund request (US-27)\nand is outside this diagram.
+@enduml

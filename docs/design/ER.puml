@@ -73,11 +73,13 @@ entity audit_records {
   * why : VARCHAR(255)
   * occurred_at : TIMESTAMPTZ
   performed_by_user_id : BIGINT <<FK>>
+  payment_id : BIGINT <<FK>>
 }
 note right of audit_records
   CHECK (length(trim(who)) > 0 AND length(trim(why)) > 0)
   performed_by_user_id NULL for system actors
   (Scheduler, callbacks, retries)
+  payment_id is NULL for admin actions
 end note
 
 entity ledger_entries {
@@ -87,7 +89,7 @@ entity ledger_entries {
   system_account_id : BIGINT <<FK>>
   agent_id : BIGINT <<FK>>
   payment_id : BIGINT <<FK>>
-  * audit_record_id : BIGINT <<FK,UQ>>
+  * audit_record_id : BIGINT <<FK>>
   * entry_type : VARCHAR(20)
   * bucket : VARCHAR(10)
   * amount : NUMERIC(12,2)
@@ -96,8 +98,7 @@ entity ledger_entries {
 }
 note right of ledger_entries
   CHECK ((wallet_id IS NOT NULL)::int + (system_account_id IS NOT NULL)::int = 1)
-  CHECK entry_type IN ('TopUp','Hold','Release','Charge',
-    'FeeIncome','Commission','RefundCredit')
+  CHECK entry_type IN ('TopUp','Hold','Release','Charge','FeeIncome','Commission','RefundCredit')
   CHECK bucket IN ('Available','Held')
   CHECK (amount <> 0)   -- signed
   CHECK (system_account_id IS NULL OR bucket = 'Available')
@@ -105,6 +106,10 @@ note right of ledger_entries
   CHECK (top_up_method IS NOT NULL) = (entry_type = 'TopUp')
   CHECK COALESCE(top_up_method = 'AgentCash', false) = (agent_id IS NOT NULL)
   Balance = SUM(amount) per wallet and bucket
+  Hold and Release are two rows each (Available and Held, opposite signs).
+  A commission is two rows: + on the agent wallet, - on the system account;
+  commissions.ledger_entry_id points to the agent's credit row.
+  amount <> 0 stays, so a payment with fee 0 writes no FeeIncome and no Commission rows.
 end note
 
 ' ---------- Billers and fees ----------
@@ -112,6 +117,7 @@ entity billers {
   * id : BIGINT <<PK>>
   --
   * name : VARCHAR(50) <<UQ>>
+  * integration_key : VARCHAR(50) <<UQ>>
   * is_active : BOOLEAN = true
 }
 
@@ -169,8 +175,7 @@ entity fraud_rules {
   max_amount : NUMERIC(12,2)
 }
 note right of fraud_rules
-  CHECK rule_type IN ('DailyLimit','VelocityLimit',
-    'BlockedAccount','SingleAmountLimit')
+  CHECK rule_type IN ('DailyLimit','VelocityLimit','BlockedAccount','SingleAmountLimit')
   VelocityLimit => max_payments, window_seconds, block_minutes NOT NULL (> 0)
   SingleAmountLimit => min_amount, max_amount NOT NULL, max >= min
 end note
@@ -179,7 +184,7 @@ entity payments {
   * id : BIGINT <<PK>>
   --
   * reference : VARCHAR(40) <<UQ>>
-  * idempotency_key : VARCHAR(100) <<UQ>>
+  * idempotency_key : VARCHAR(100)
   * customer_id : BIGINT <<FK>>
   agent_id : BIGINT <<FK>>
   * biller_service_id : BIGINT <<FK>>
@@ -195,11 +200,13 @@ entity payments {
   * created_at : TIMESTAMPTZ
 }
 note right of payments
-  CHECK state IN ('Initiated','FundsHeld','SentToBiller','Completed',
-    'Failed','Unknown','Rejected','Refunded')
+  UNIQUE (customer_id, idempotency_key)
+  CHECK state IN ('Initiated','FundsHeld','SentToBiller','Completed','Failed','Unknown','Rejected','Refunded')
   CHECK (bill_amount > 0 AND fee >= 0 AND requery_count >= 0)
   CHECK (rejected_by_fraud_rule_id IS NULL OR state = 'Rejected')
   NO total column (= bill_amount + fee)
+  State changes run under a row lock (SELECT ... FOR UPDATE)
+  so two events cannot both release the same hold.
 end note
 
 entity payment_state_changes {
@@ -230,6 +237,7 @@ entity commissions {
 }
 note right of commissions
   CHECK (rate BETWEEN 0 AND 100 AND amount >= 0)
+  No row when the payment fee is 0.
 end note
 
 entity refunds {
@@ -321,8 +329,7 @@ entity reconciliation_differences {
   * reviewed : BOOLEAN = false
 }
 note right of reconciliation_differences
-  CHECK difference_type IN ('MissingInPayLink',
-    'MissingInSettlement','StatusMismatch')
+  CHECK difference_type IN ('MissingInPayLink','MissingInSettlement','StatusMismatch')
   MissingInPayLink => payment_id, paylink_state NULL
   other types => payment_id NOT NULL
   CHECK paylink_state IN (the 8 payment states) OR NULL
@@ -335,8 +342,9 @@ wallets ||--o{ ledger_entries : records
 system_accounts ||--o{ ledger_entries : records
 users |o--o{ ledger_entries : collects cash top-up
 payments |o--o{ ledger_entries : moves money for
-audit_records ||--o| ledger_entries : audits
+audit_records ||--o{ ledger_entries : audits
 users |o--o{ audit_records : performed by
+payments |o--o{ audit_records : concerns
 
 billers ||--|{ biller_services : offers
 fee_rules ||--o{ biller_services : prices
