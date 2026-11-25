@@ -71,11 +71,12 @@ alt a failed event reached PaymentProcessing (trigger a, b refused, or c)
   activate PaymentProcessing
 
   == 2. Guard and transition to Failed ==
-  PaymentProcessing -> PaymentProcessing : find Payment by reference, check current state
+  PaymentProcessing -> PaymentProcessing : lock the Payment row (by reference), then check current state
+  note over PaymentProcessing : The lock, the transition to Failed and the hold release happen in the same\ntransaction, so two events at the same moment never release the hold twice.
 
   alt Payment is already Failed, Refunded or Completed (any state other than SentToBiller or Unknown)
     PaymentProcessing -> PaymentProcessing : refuse the transition, ignore the event
-    PaymentProcessing -> AuditLog : writeAuditRecord(IgnoredFailedEvent, who = source system actor, why = reason code)
+    PaymentProcessing -> AuditLog : writeAuditRecord(IgnoredFailedEvent, who = source system actor, why = reason code, reference)
     activate AuditLog
     AuditLog --> PaymentProcessing : recorded
     deactivate AuditLog
@@ -88,11 +89,13 @@ alt a failed event reached PaymentProcessing (trigger a, b refused, or c)
     == 3. Release the hold ==
     PaymentProcessing -> AccountsAndWallet : releaseHold(reference, who, why)
     activate AccountsAndWallet
-    AccountsAndWallet -> AccountsAndWallet : append LedgerEntry Release\n(Held -> Available, total)
-    AccountsAndWallet -> AuditLog : writeAuditRecord(Release, who = TopUpNet callback, Scheduler or Reconciliation, why = reason code)
+    AccountsAndWallet -> AccountsAndWallet : append LedgerEntry Release\n(Held, -total)
+    AccountsAndWallet -> AccountsAndWallet : append LedgerEntry Release\n(Available, +total)
+    AccountsAndWallet -> AuditLog : writeAuditRecord(Release, who = TopUpNet callback, Scheduler or Reconciliation, why = reason code, reference)
     activate AuditLog
     AuditLog --> AccountsAndWallet : recorded
     deactivate AuditLog
+    note over AccountsAndWallet, AuditLog : One audit record covers both Release entries.
     AccountsAndWallet --> PaymentProcessing : hold released
     deactivate AccountsAndWallet
     PaymentProcessing -> PaymentProcessing : move Payment to Refunded
@@ -101,7 +104,7 @@ alt a failed event reached PaymentProcessing (trigger a, b refused, or c)
     == 4. Notify the Customer (never changes the payment state) ==
     PaymentProcessing ->> Notifications : notifyOutcome(reference, Refunded, statusReason)
     activate Notifications
-    note over Notifications, Provider : Customer only. The Agent is not notified for failures.
+    note over Notifications, Provider : Customer only.
     loop up to 3 attempts, stop when delivered
       Notifications ->> Provider : sendSMS and sendPush (message includes statusReason)
       activate Provider
